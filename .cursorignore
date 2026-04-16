@@ -1,0 +1,17 @@
+﻿# Speed up Cursor indexing / file search by excluding large generated folders.
+# This does not affect Next.js builds if you run them normally — it only affects editor tooling.
+
+node_modules/
+.next/
+out/
+build/
+coverage/
+
+# OS / tooling noise
+.DS_Store
+
+# Local env / deploy tooling (never need editor-wide search across these)
+.env*
+!.env.example
+railway.local.env
+.railway/
