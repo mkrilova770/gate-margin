@@ -5,6 +5,7 @@ import {
   fetchWithTimeout,
 } from "./types";
 import { GateMarginPair, GateBorrowInfo } from "@/types";
+import { gateFetchSigned, getGateCredentialsFromEnv } from "@/lib/gateAuth";
 
 // ─── Margin pairs ───────────────────────────────────────────────────────────
 
@@ -45,30 +46,131 @@ interface GateEarnUniRate {
   est_rate: string; // annual decimal, e.g. "0.034953"
 }
 
+/** `GET /api/v4/margin/uni/borrowable` — signed, account-aware max borrow in base currency */
+interface GateMaxUniBorrowable {
+  currency?: string;
+  currency_pair?: string;
+  borrowable?: string;
+}
+
+function gateBorrowableConcurrency(): number {
+  const raw = process.env.GATE_BORROWABLE_CONCURRENCY?.trim();
+  const n = raw ? parseInt(raw, 10) : 18;
+  if (!Number.isFinite(n)) return 18;
+  return Math.max(1, Math.min(40, n));
+}
+
+/** When unique base count is at most this, fetch spot + margin per pair (small JSON) instead of full lists. */
+function gatePairFetchThreshold(): number {
+  const raw = process.env.GATE_PAIR_FETCH_THRESHOLD?.trim();
+  const n = raw ? parseInt(raw, 10) : 140;
+  if (!Number.isFinite(n)) return 140;
+  return Math.max(30, Math.min(400, n));
+}
+
+function gatePublicPairConcurrency(): number {
+  const raw = process.env.GATE_PUBLIC_PAIR_CONCURRENCY?.trim();
+  const n = raw ? parseInt(raw, 10) : 16;
+  if (!Number.isFinite(n)) return 16;
+  return Math.max(4, Math.min(32, n));
+}
+
+function gateBorrowableTimeoutMs(): number {
+  const raw = process.env.GATE_BORROWABLE_TIMEOUT_MS?.trim();
+  const n = raw ? parseInt(raw, 10) : 15_000;
+  if (!Number.isFinite(n)) return 15_000;
+  return Math.max(3_000, Math.min(60_000, n));
+}
+
 /**
- * Fetch Gate isolated-margin borrow info per token.
- *
- * Public data source (fast, no auth):
- * - Borrow APR: GET /api/v4/earn/uni/rate (est_rate annual decimal)
- * - Liquidity (USDT cap): GET /api/v4/margin/currency_pairs (`max_quote_amount` for USDT pairs)
- * - Spot price: GET /api/v4/spot/tickers (for optional token amount display)
+ * Run async work over `items` with at most `concurrency` in-flight tasks (pool of workers).
  */
-export async function fetchGateBorrowInfo(
-  tokens: string[]
-): Promise<Map<string, GateBorrowInfo>> {
-  const [ratesRes, marginPairsRes, spotRes] = await Promise.allSettled([
-    fetchWithTimeout("https://api.gateio.ws/api/v4/earn/uni/rate", {}, 15_000).then(
-      (r) => (r.ok ? (r.json() as Promise<GateEarnUniRate[]>) : ([] as GateEarnUniRate[]))
-    ),
-    fetchWithTimeout("https://api.gateio.ws/api/v4/margin/currency_pairs", {}, 15_000).then(
+async function runPool<T>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  let next = 0;
+
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]!);
+    }
+  };
+
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+}
+
+async function fetchGateSpotAndMarginMapsForBases(
+  bases: readonly string[]
+): Promise<{ spotMap: Map<string, number>; maxQuoteUsdtByBase: Map<string, number> }> {
+  const spotMap = new Map<string, number>();
+  const maxQuoteUsdtByBase = new Map<string, number>();
+  const conc = gatePublicPairConcurrency();
+
+  await Promise.all([
+    runPool(bases, conc, async (base) => {
+      const pair = `${base}_USDT`;
+      try {
+        const res = await fetchWithTimeout(
+          `https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${encodeURIComponent(pair)}`,
+          {},
+          12_000
+        );
+        if (!res.ok) return;
+        const arr: GateSpotTicker[] = await res.json();
+        const item = Array.isArray(arr) ? arr[0] : null;
+        if (!item?.last) return;
+        const px = parseFloat(item.last);
+        if (Number.isFinite(px) && px > 0) spotMap.set(base, px);
+      } catch {
+        /* ignore */
+      }
+    }),
+    runPool(bases, conc, async (base) => {
+      const pair = `${base}_USDT`;
+      try {
+        const res = await fetchWithTimeout(
+          `https://api.gateio.ws/api/v4/margin/currency_pairs/${encodeURIComponent(pair)}`,
+          {},
+          12_000
+        );
+        if (!res.ok) return;
+        const p = (await res.json()) as GateMarginPairRaw;
+        if (p.quote !== "USDT" || p.status !== 1) return;
+        const maxQuote = parseFloat(p.max_quote_amount || "0");
+        if (!Number.isFinite(maxQuote) || maxQuote <= 0) return;
+        const prev = maxQuoteUsdtByBase.get(base);
+        if (prev == null || maxQuote > prev) maxQuoteUsdtByBase.set(base, maxQuote);
+      } catch {
+        /* ignore */
+      }
+    }),
+  ]);
+
+  return { spotMap, maxQuoteUsdtByBase };
+}
+
+async function fetchGateSpotAndMarginMapsBulk(): Promise<{
+  spotMap: Map<string, number>;
+  maxQuoteUsdtByBase: Map<string, number>;
+}> {
+  const spotMap = new Map<string, number>();
+  const maxQuoteUsdtByBase = new Map<string, number>();
+
+  const [marginPairsRes, spotRes] = await Promise.allSettled([
+    fetchWithTimeout("https://api.gateio.ws/api/v4/margin/currency_pairs", {}, 20_000).then(
       (r) => (r.ok ? (r.json() as Promise<GateMarginPairRaw[]>) : ([] as GateMarginPairRaw[]))
     ),
-    fetchWithTimeout("https://api.gateio.ws/api/v4/spot/tickers", {}, 15_000).then(
+    fetchWithTimeout("https://api.gateio.ws/api/v4/spot/tickers", {}, 20_000).then(
       (r) => (r.ok ? (r.json() as Promise<GateSpotTicker[]>) : ([] as GateSpotTicker[]))
     ),
   ]);
 
-  const spotMap = new Map<string, number>();
   if (spotRes.status === "fulfilled") {
     for (const item of spotRes.value) {
       if (item.currency_pair.endsWith("_USDT")) {
@@ -76,6 +178,61 @@ export async function fetchGateBorrowInfo(
         spotMap.set(base, parseFloat(item.last || "0"));
       }
     }
+  }
+
+  if (marginPairsRes.status === "fulfilled") {
+    for (const p of marginPairsRes.value) {
+      if (p.quote !== "USDT" || p.status !== 1) continue;
+      const base = (p.base || "").toUpperCase();
+      if (!base) continue;
+      const maxQuote = parseFloat(p.max_quote_amount || "0");
+      if (!Number.isFinite(maxQuote) || maxQuote <= 0) continue;
+      const prev = maxQuoteUsdtByBase.get(base);
+      if (prev == null || maxQuote > prev) maxQuoteUsdtByBase.set(base, maxQuote);
+    }
+  }
+
+  return { spotMap, maxQuoteUsdtByBase };
+}
+
+/**
+ * Fetch Gate isolated-margin borrow info per token.
+ *
+ * Public (always):
+ * - Borrow APR: GET /api/v4/earn/uni/rate (`est_rate` annual decimal → %)
+ * - Spot + margin cap: either per-pair `spot/tickers?currency_pair=` and
+ *   `margin/currency_pairs/{PAIR}` when base count ≤ `GATE_PAIR_FETCH_THRESHOLD`, or full list
+ *   endpoints (large JSON) above that threshold.
+ * - Fallback liquidity: `max_quote_amount` from margin pair (platform cap)
+ *
+ * Optional signed (`GATE_API_KEY` + `GATE_API_SECRET`):
+ * - GET /api/v4/margin/uni/borrowable?currency=BASE&currency_pair=BASE_USDT → `borrowable` (base units)
+ *   Per-token, concurrency-limited (`GATE_BORROWABLE_CONCURRENCY`). On error / missing value → fallback cap.
+ */
+export async function fetchGateBorrowInfo(
+  tokens: string[]
+): Promise<Map<string, GateBorrowInfo>> {
+  const uniqueBases = [...new Set(tokens.map((t) => t.toUpperCase()))].sort();
+  if (uniqueBases.length === 0) {
+    return new Map();
+  }
+
+  const threshold = gatePairFetchThreshold();
+
+  const [ratesRes, mapsRes] = await Promise.allSettled([
+    fetchWithTimeout("https://api.gateio.ws/api/v4/earn/uni/rate", {}, 15_000).then(
+      (r) => (r.ok ? (r.json() as Promise<GateEarnUniRate[]>) : ([] as GateEarnUniRate[]))
+    ),
+    uniqueBases.length <= threshold && uniqueBases.length > 0
+      ? fetchGateSpotAndMarginMapsForBases(uniqueBases)
+      : fetchGateSpotAndMarginMapsBulk(),
+  ]);
+
+  const spotMap = new Map<string, number>();
+  const maxQuoteUsdtByBase = new Map<string, number>();
+  if (mapsRes.status === "fulfilled") {
+    for (const [k, v] of mapsRes.value.spotMap) spotMap.set(k, v);
+    for (const [k, v] of mapsRes.value.maxQuoteUsdtByBase) maxQuoteUsdtByBase.set(k, v);
   }
 
   const aprMap = new Map<string, number>();
@@ -89,28 +246,66 @@ export async function fetchGateBorrowInfo(
     }
   }
 
-  /** Per-base max quote (USDT) from isolated margin pairs (platform cap, not live pool). */
-  const maxQuoteUsdtByBase = new Map<string, number>();
-  if (marginPairsRes.status === "fulfilled") {
-    for (const p of marginPairsRes.value) {
-      if (p.quote !== "USDT" || p.status !== 1) continue;
-      const base = (p.base || "").toUpperCase();
-      if (!base) continue;
-      const maxQuote = parseFloat(p.max_quote_amount || "0");
-      if (!Number.isFinite(maxQuote) || maxQuote <= 0) continue;
-      // If duplicates exist, keep the max cap we see.
-      const prev = maxQuoteUsdtByBase.get(base);
-      if (prev == null || maxQuote > prev) maxQuoteUsdtByBase.set(base, maxQuote);
-    }
+  const creds = getGateCredentialsFromEnv();
+  /** `null` = error / missing; `0` = valid zero borrowable */
+  const signedBorrowableByBase = new Map<string, number | null>();
+
+  if (creds && uniqueBases.length > 0) {
+    const path = "/api/v4/margin/uni/borrowable";
+    const conc = gateBorrowableConcurrency();
+    const timeoutMs = gateBorrowableTimeoutMs();
+
+    await runPool(uniqueBases, conc, async (base) => {
+      try {
+        const res = await gateFetchSigned(creds, path, {
+          query: [
+            ["currency", base],
+            ["currency_pair", `${base}_USDT`],
+          ],
+          timeoutMs,
+        });
+        if (!res.ok) {
+          signedBorrowableByBase.set(base, null);
+          return;
+        }
+        const data = (await res.json()) as GateMaxUniBorrowable;
+        const raw = data.borrowable;
+        if (raw == null || raw === "") {
+          signedBorrowableByBase.set(base, null);
+          return;
+        }
+        const b = parseFloat(String(raw));
+        if (!Number.isFinite(b) || b < 0) {
+          signedBorrowableByBase.set(base, null);
+          return;
+        }
+        signedBorrowableByBase.set(base, b);
+      } catch {
+        signedBorrowableByBase.set(base, null);
+      }
+    });
   }
 
   const result = new Map<string, GateBorrowInfo>();
   for (const token of tokens) {
     const upper = token.toUpperCase();
     const spotPrice = spotMap.get(upper) ?? 0;
-    const liquidityUsdt = maxQuoteUsdtByBase.get(upper) ?? null;
-    const liquidityToken =
-      liquidityUsdt != null && spotPrice > 0 ? liquidityUsdt / spotPrice : null;
+
+    const capUsdt = maxQuoteUsdtByBase.get(upper) ?? null;
+    const capToken =
+      capUsdt != null && spotPrice > 0 ? capUsdt / spotPrice : null;
+
+    let liquidityToken: number | null = capToken;
+    let liquidityUsdt: number | null = capUsdt;
+
+    if (creds) {
+      const signed = signedBorrowableByBase.get(upper);
+      if (signed != null) {
+        liquidityToken = signed;
+        liquidityUsdt = spotPrice > 0 ? signed * spotPrice : signed === 0 ? 0 : null;
+      }
+      // signed === null → keep margin-pair cap fallback
+    }
 
     result.set(upper, {
       currency: upper,

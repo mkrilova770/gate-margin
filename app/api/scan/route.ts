@@ -23,6 +23,8 @@ export const revalidate = 0;
 /**
  * When `SCAN_UPSTREAM_URL` is set (e.g. Railway app origin), this route returns a **read-only
  * copy** of `GET {origin}/api/scan` only — no POST body, no mutations on the remote host.
+ * Opt-in flag `SCAN_UPSTREAM_ENABLED` is not required: URL alone enables the mirror (unless
+ * `SCAN_UPSTREAM_DISABLED` is set).
  */
 function scanUpstreamBase(): string | null {
   const raw = process.env.SCAN_UPSTREAM_URL?.trim();
@@ -60,11 +62,6 @@ function upstreamWouldLoopToSelf(request: Request, upstreamBase: string): boolea
 async function tryRespondWithUpstreamScanCopy(
   request: Request
 ): Promise<NextResponse | null> {
-  const upstreamEnabled =
-    process.env.SCAN_UPSTREAM_ENABLED?.trim() === "1" ||
-    process.env.SCAN_UPSTREAM_ENABLED?.trim()?.toLowerCase() === "true";
-  if (!upstreamEnabled) return null;
-
   const upstreamDisabled =
     process.env.SCAN_UPSTREAM_DISABLED?.trim() === "1" ||
     process.env.SCAN_UPSTREAM_DISABLED?.trim()?.toLowerCase() === "true";
@@ -166,10 +163,10 @@ async function buildScanResponse(): Promise<ScanResponse> {
   const gateTokens = [...new Set(gatePairs.map((p) => p.base.toUpperCase()))];
   const tokenSet = new Set(gateTokens);
 
-  // Step 2: fetch borrow info + all exchange funding in parallel
-  const [borrowResult, ...adapterResults] = await Promise.allSettled([
-    fetchGateBorrowInfo(gateTokens),
-    ...adapters.map((adapter) =>
+  // Step 2: fetch all exchange funding first. This lets us limit expensive Gate signed
+  // borrowable calls only to tokens that actually have at least one funding venue.
+  const adapterResults = await Promise.allSettled(
+    adapters.map((adapter) =>
       adapter
         .fetchFunding(tokenSet)
         .then((map) => ({ name: adapter.name, map }))
@@ -177,29 +174,8 @@ async function buildScanResponse(): Promise<ScanResponse> {
           const msg = err instanceof Error ? err.message : String(err);
           return { name: adapter.name, map: new Map<string, FundingInfo>(), error: msg };
         })
-    ),
-  ]);
-
-  // Build borrow map
-  const borrowMap = new Map<
-    string,
-    { borrowAPR: number; liquidityToken: number | null; liquidityUsdt: number | null; spotPrice: number }
-  >();
-  if (borrowResult.status === "fulfilled") {
-    for (const [token, info] of borrowResult.value.entries()) {
-      borrowMap.set(token, {
-        borrowAPR: info.borrowAPR,
-        liquidityToken: info.liquidityToken,
-        liquidityUsdt: info.liquidityUsdt,
-        spotPrice: info.spotPrice,
-      });
-    }
-  } else {
-    errors["Gate.Borrow"] =
-      borrowResult.reason instanceof Error
-        ? borrowResult.reason.message
-        : String(borrowResult.reason);
-  }
+    )
+  );
 
   // Build exchange funding maps
   const exchangeFundingMaps = new Map<string, Map<string, FundingInfo>>();
@@ -215,10 +191,35 @@ async function buildScanResponse(): Promise<ScanResponse> {
     }
   }
 
-  // Step 3: build arbitrage rows
+  const relevantTokens = gateTokens.filter((token) =>
+    [...exchangeFundingMaps.values()].some((fundingMap) => fundingMap.has(token))
+  );
+
+  // Step 3: fetch Gate borrow side only for tokens that can actually produce rows.
+  const borrowMap = new Map<
+    string,
+    { borrowAPR: number; liquidityToken: number | null; liquidityUsdt: number | null; spotPrice: number }
+  >();
+  if (relevantTokens.length > 0) {
+    try {
+      const borrowInfo = await fetchGateBorrowInfo(relevantTokens);
+      for (const [token, info] of borrowInfo.entries()) {
+        borrowMap.set(token, {
+          borrowAPR: info.borrowAPR,
+          liquidityToken: info.liquidityToken,
+          liquidityUsdt: info.liquidityUsdt,
+          spotPrice: info.spotPrice,
+        });
+      }
+    } catch (err) {
+      errors["Gate.Borrow"] = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // Step 4: build arbitrage rows
   const rows: ArbitrageRow[] = [];
 
-  for (const token of gateTokens) {
+  for (const token of relevantTokens) {
     const borrow = borrowMap.get(token);
     const borrowAPR = borrow?.borrowAPR ?? 0;
     const spotPrice = borrow?.spotPrice ?? 0;

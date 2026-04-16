@@ -1,8 +1,8 @@
-# Funding Arbitrage Scanner (Bitget)
+# Funding Arbitrage Scanner (Gate short)
 
-Веб-приложение для сканирования арбитража фандинга: **сторона Short / заём** — **Bitget USDT isolated margin**, **сторона Long** — **USDT perpetual** на нескольких биржах (Binance, OKX, Bybit, Gate, Bitget, BingX, XT, MEXC, BitMart, KuCoin).
+Next.js app: **short / borrow** — **Gate isolated margin (USDT pairs)**; **long** — **USDT perpetual** on Binance, OKX, Bybit, Gate, Bitget, BingX, XT, MEXC, BitMart, KuCoin.
 
-## Быстрый старт
+## Quick start
 
 ```bash
 npm install
@@ -10,132 +10,72 @@ npm run dev
 # http://localhost:3000
 ```
 
----
+## Strategy
 
-## Стратегия
+| Side | Market | Data |
+|------|--------|------|
+| **Short** | Gate isolated margin (base vs USDT) | Borrow APR from public `GET /api/v4/earn/uni/rate` (`est_rate`). Liquidity: optional signed `GET /api/v4/margin/uni/borrowable`, else public cap from `margin/currency_pairs.max_quote_amount`. |
+| **Long** | USDT perp | Funding from each exchange adapter |
 
-| Сторона | Позиция | Описание |
-|---------|---------|----------|
-| **Long** | USDT perp | Binance / OKX / Bybit / Gate / Bitget / BingX / XT / MEXC / BitMart / KuCoin |
-| **Short** | Bitget isolated margin | Заём базового актива под шорт |
+**Net APR** = Funding APR − Borrow APR − Trading fees (see `lib/fees.ts`).
 
-**Net APR = Funding APR − Borrow APR** (borrow с Bitget: подписанные V2 isolated + публичный UTA `margin-loans`).
+## Formulas
 
----
-
-## Формулы
-
-### Funding APR (% годовых)
+### Funding APR (% per year)
 
 ```
 Funding APR = rawFundingRate × (8760 / intervalHours) × 100
 ```
 
-### Borrow APR (Bitget)
+(same as `raw × 3 × 365 × 100` when interval is 8h)
 
-Годовая ставка из signed **`/api/v2/margin/isolated/interest-rate-and-limit`** или из **`/api/v3/market/margin-loans`** (UTA), в процентах.
+### Borrow APR (Gate)
 
-### Spread (не в Net APR)
+Annual % from `est_rate` on `GET /api/v4/earn/uni/rate` (already an annual decimal in the API).
 
-```
-Spread% = (futuresPrice - spotPrice) / spotPrice × 100
-```
+### Borrow liquidity (display)
 
----
+1. **With `GATE_API_KEY` / `GATE_API_SECRET`**: max borrowable base amount from `GET /api/v4/margin/uni/borrowable` (account / uni-margin context), converted to USDT with Gate spot last.
+2. **Without keys**: fallback to platform cap `max_quote_amount` (USDT) from `GET /api/v4/margin/currency_pairs`, converted to base with spot.
 
-## Архитектура (кратко)
+Tune concurrency: `GATE_BORROWABLE_CONCURRENCY` (default `12`), timeout: `GATE_BORROWABLE_TIMEOUT_MS` (default `15000`).
 
-1. `GET /api/scan` — токены с Bitget `margin/currencies` (isolated USDT base borrowable), borrow+spot, фандинг со всех адаптеров.
-2. Frontend: React Query, автообновление, таблица и модалка с графиками.
-3. Дополнительные маршруты `app/api/gate/*` (Gate + Playwright) оставлены для отладки; **основной сканер их не вызывает**.
+## Architecture
 
----
+1. `GET /api/scan` — universe from Gate `margin/currency_pairs` (USDT, enabled); borrow + spot; funding from all adapters in parallel (`Promise.allSettled`). In-memory SWR cache (`SCAN_SWR_TTL_MS`, default 45s): stale responses return immediately while a background refresh runs.
+2. Frontend: React Query, table + charts.
 
-## Деплой на Railway
+## Deploy (Railway)
 
-Отдельный сервис или проект **не мешает** уже развёрнутому сайту с Gate: у каждого сервиса свой URL, переменные и билд.
+1. Push repo (no `.env.local` / secrets in git).
+2. Railway → Deploy from GitHub; **`Dockerfile`** + **`railway.toml`** are used.
+3. Variables: see table below. `PORT` is set by Railway.
 
-### Шаги
+### Environment variables
 
-1. Залейте этот репозиторий на GitHub (без `.env.local` и секретов).
-2. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → выберите репозиторий с этим кодом.
-3. Railway подхватит **`railway.toml`** и соберёт образ по **`Dockerfile`**.
-4. В сервисе → **Settings** → **Networking** → включите **Generate Domain** (публичный HTTPS URL).
-5. **Variables** → добавьте переменные из таблицы ниже (минимум три `BITGET_*` для полных лимитов займа).
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `GATE_API_KEY` / `GATE_API_SECRET` | Signed `margin/uni/borrowable` for liquidity column | No (fallback cap without) |
+| `GATE_BORROWABLE_CONCURRENCY` | Parallel signed borrowable calls (1–40) | No |
+| `GATE_BORROWABLE_TIMEOUT_MS` | Per-request timeout (ms) | No |
+| `GATE_PAIR_FETCH_THRESHOLD` | If unique bases ≤ this, use small per-pair Gate spot/margin requests (default 140) | No |
+| `GATE_PUBLIC_PAIR_CONCURRENCY` | Parallelism for those per-pair public calls (default 16) | No |
+| `BITGET_API_KEY` / `BITGET_API_SECRET` / `BITGET_PASSPHRASE` | Bitget adapter borrow extras | No |
+| `NEXT_PUBLIC_SCAN_TIMEOUT_MS` | Client fetch timeout for `/api/scan` | No |
+| `SCAN_SWR_TTL_MS` | Server cache TTL before background refresh (ms) | No |
+| `SCAN_UPSTREAM_URL` | If set, **this** service returns a read-only copy of `GET {origin}/api/scan` | No |
+| `SCAN_UPSTREAM_TIMEOUT_MS` | Upstream fetch timeout | No |
+| `SCAN_UPSTREAM_DISABLED` | `1` / `true` — force local scan even if `SCAN_UPSTREAM_URL` is set | No |
 
-### Переменные окружения (Railway)
+> **Security:** do not commit secrets. Use Railway Variables or local `.env.local` (gitignored).
 
-| Переменная | Описание | Обязательная |
-|------------|----------|----------------|
-| `BITGET_API_KEY` | API Key Bitget | Для signed isolated borrow |
-| `BITGET_API_SECRET` | Секрет ключа | То же |
-| `BITGET_PASSPHRASE` | Passphrase ключа | То же |
-| `BITGET_ACCOUNT_MAX_BORROW` | `1` или `true` — тяжёлый POST max-borrowable по токенам | Нет (по умолчанию выкл.) |
-| `NEXT_PUBLIC_SCAN_TIMEOUT_MS` | Таймаут клиента на `/api/scan` (мс), напр. `120000` | Нет |
-| `SCAN_UPSTREAM_URL` | Если задать origin другого инстанса — этот сервер только **проксирует** `GET /api/scan` (read-only) | Нет |
-| `SCAN_UPSTREAM_TIMEOUT_MS` | Таймаут прокси к upstream (мс) | Нет |
+## Docker image
 
-Переменная **`PORT`** задаётся Railway автоматически; `next start` её подхватывает.
+Standard Node image from the repo `Dockerfile` (no Playwright in this project).
 
-> **Важно:** `.env.local` в git не попадает. Секреты только в Dashboard Railway (или **Shared Variables** на уровне проекта, если нужно).
+## Requirements
 
-### Docker-образ
+- Node 20+ (see `package.json` / Next 16)
+- Outbound HTTPS to exchange APIs
 
-База **Playwright** (`chromium`) — для совместимости с кодом `gate-rate-cap`; главная страница и `/api/scan` от неё не зависят.
-
-### Доступ Cursor / агента к Railway CLI (токен локально)
-
-Я не могу «войти» в браузер за вас, но могу запускать деплой из терминала, если токен лежит **только на диске**, не в чате:
-
-1. Создайте токен: [railway.app/account/tokens](https://railway.app/account/tokens) (**New token**) или **Project → Settings → Tokens** (project token).
-2. Скопируйте **`railway.local.env.example`** → **`railway.local.env`** в корне репозитория.
-3. Вставьте значение в строку `RAILWAY_TOKEN=...` и сохраните файл.  
-   **Не отправляйте** токен в сообщения ИИ и не коммитьте `railway.local.env` (он в `.gitignore`).
-4. Один раз свяжите каталог с проектом (ID из URL дашборда Railway; имя сервиса как в UI):
-
-   ```powershell
-   npm run railway:whoami
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/railway-with-env.ps1 link -p <PROJECT_ID> -e production -s <SERVICE_NAME_OR_ID>
-   ```
-
-   Конфиг сохранится в **`.railway/`** (тоже в `.gitignore`).
-
-5. Деплой текущего кода с этой машины:
-
-   ```powershell
-   npm run railway:up
-   ```
-
-   Логи: `npm run railway:logs`; повторный деплой того же билда: `npm run railway:redeploy`.
-
-Скрипт **`scripts/railway-with-env.ps1`** подхватывает `railway.local.env` и вызывает CLI. На Railway в веб-интерфейсе по-прежнему нужно задать **`BITGET_*`** для самого приложения.
-
----
-
-## Поля таблицы
-
-| Поле | Описание |
-|------|----------|
-| Token | Базовый токен |
-| Best Exchange | Лучший long по Net APR |
-| Raw Funding / Funding APR | Ставка фандинга long-биржи |
-| Borrow APR | Bitget (годовые %) |
-| Spread | Базис фьючерс/спот Bitget |
-| Available Borrow | Лимит займа (токены + ~USDT), источник: Bitget API |
-| Next Funding | До следующего фандинга (long) |
-
----
-
-## Замечания
-
-- Лимиты в таблице — из **конфигурации/API Bitget** (isolated interest/tier/UTA), не «реальный пул» и не персональный макс.; персональный макс. ближе к **`BITGET_ACCOUNT_MAX_BORROW`**.
-- На Bitget должен быть **открыт маржинальный счёт**, иначе signed isolated даст 50021 и лимиты частично «без лимита».
-
----
-
-## Требования
-
-- Node.js 18+ (локально), Docker на Railway
-- Сеть до бирж (REST)
-
-См. также **`.env.example`** для локальной настройки.
+See **`.env.example`** for local copy-paste.

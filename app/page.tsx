@@ -220,18 +220,7 @@ function Dashboard() {
       {/* Main table */}
       <main className="max-w-screen-2xl mx-auto px-4 pb-8">
         <div className="bg-gray-900/50 border border-gray-800 rounded-xl overflow-hidden">
-          {isLoading ? (
-            <div className="flex flex-col items-center justify-center h-64 gap-3">
-              <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              <div className="text-gray-400 text-sm">
-                Loading data from 10 exchanges...
-              </div>
-              <div className="text-gray-600 text-xs">
-                First load usually takes a few seconds (Gate Earn Uni + 10 exchanges).
-                If upstream is slow, you can still use SCAN_UPSTREAM_URL in .env.local as a mirror.
-              </div>
-            </div>
-          ) : isError ? (
+          {isError ? (
             <div className="flex flex-col items-center justify-center h-48 gap-2">
               <div className="text-red-400 text-sm">Failed to load data</div>
               <button
@@ -242,11 +231,22 @@ function Dashboard() {
               </button>
             </div>
           ) : (
-            <ArbitrageTable
-              rows={filteredRows}
-              search={search}
-              onRowClick={setSelectedRow}
-            />
+            <div className="relative">
+              {(isLoading || isFetching) && filteredRows.length === 0 ? (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-[#0a0e17]/80 backdrop-blur-[2px] pointer-events-none">
+                  <div className="w-7 h-7 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  <div className="text-gray-400 text-xs px-4 text-center">
+                    Загрузка первого скана (биржи + Gate)… страница уже открыта, данные появятся в
+                    таблице.
+                  </div>
+                </div>
+              ) : null}
+              <ArbitrageTable
+                rows={filteredRows}
+                search={search}
+                onRowClick={setSelectedRow}
+              />
+            </div>
           )}
         </div>
       </main>
