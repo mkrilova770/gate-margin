@@ -60,6 +60,11 @@ function upstreamWouldLoopToSelf(request: Request, upstreamBase: string): boolea
 async function tryRespondWithUpstreamScanCopy(
   request: Request
 ): Promise<NextResponse | null> {
+  const upstreamEnabled =
+    process.env.SCAN_UPSTREAM_ENABLED?.trim() === "1" ||
+    process.env.SCAN_UPSTREAM_ENABLED?.trim()?.toLowerCase() === "true";
+  if (!upstreamEnabled) return null;
+
   const upstreamDisabled =
     process.env.SCAN_UPSTREAM_DISABLED?.trim() === "1" ||
     process.env.SCAN_UPSTREAM_DISABLED?.trim()?.toLowerCase() === "true";
