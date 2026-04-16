@@ -45,34 +45,23 @@ interface GateEarnUniRate {
   est_rate: string; // annual decimal, e.g. "0.034953"
 }
 
-interface GateEarnUniCurrency {
-  currency: string; // e.g. "BTC"
-  amount: string; // total in pool
-  lent_amount: string; // already lent out
-  frozen_amount: string; // frozen / reserved
-}
-
 /**
  * Fetch Gate isolated-margin borrow info per token.
  *
  * Public data source (fast, no auth):
  * - Borrow APR: GET /api/v4/earn/uni/rate (est_rate annual decimal)
- * - Liquidity:  GET /api/v4/earn/uni/currencies (available = amount - lent_amount - frozen_amount)
- * - Spot price: GET /api/v4/spot/tickers (for USDT conversion)
+ * - Liquidity (USDT cap): GET /api/v4/margin/currency_pairs (`max_quote_amount` for USDT pairs)
+ * - Spot price: GET /api/v4/spot/tickers (for optional token amount display)
  */
 export async function fetchGateBorrowInfo(
   tokens: string[]
 ): Promise<Map<string, GateBorrowInfo>> {
-  const [ratesRes, currenciesRes, spotRes] = await Promise.allSettled([
+  const [ratesRes, marginPairsRes, spotRes] = await Promise.allSettled([
     fetchWithTimeout("https://api.gateio.ws/api/v4/earn/uni/rate", {}, 15_000).then(
       (r) => (r.ok ? (r.json() as Promise<GateEarnUniRate[]>) : ([] as GateEarnUniRate[]))
     ),
-    fetchWithTimeout(
-      "https://api.gateio.ws/api/v4/earn/uni/currencies",
-      {},
-      15_000
-    ).then((r) =>
-      r.ok ? (r.json() as Promise<GateEarnUniCurrency[]>) : ([] as GateEarnUniCurrency[])
+    fetchWithTimeout("https://api.gateio.ws/api/v4/margin/currency_pairs", {}, 15_000).then(
+      (r) => (r.ok ? (r.json() as Promise<GateMarginPairRaw[]>) : ([] as GateMarginPairRaw[]))
     ),
     fetchWithTimeout("https://api.gateio.ws/api/v4/spot/tickers", {}, 15_000).then(
       (r) => (r.ok ? (r.json() as Promise<GateSpotTicker[]>) : ([] as GateSpotTicker[]))
@@ -100,19 +89,18 @@ export async function fetchGateBorrowInfo(
     }
   }
 
-  const availableTokenMap = new Map<string, number>();
-  if (currenciesRes.status === "fulfilled") {
-    for (const item of currenciesRes.value) {
-      const upper = (item.currency || "").toUpperCase();
-      if (!upper) continue;
-      const amount = parseFloat(item.amount || "0");
-      const lent = parseFloat(item.lent_amount || "0");
-      const frozen = parseFloat(item.frozen_amount || "0");
-      if (![amount, lent, frozen].every((n) => Number.isFinite(n))) continue;
-      const available = amount - lent - frozen;
-      if (Number.isFinite(available) && available >= 0) {
-        availableTokenMap.set(upper, available);
-      }
+  /** Per-base max quote (USDT) from isolated margin pairs (platform cap, not live pool). */
+  const maxQuoteUsdtByBase = new Map<string, number>();
+  if (marginPairsRes.status === "fulfilled") {
+    for (const p of marginPairsRes.value) {
+      if (p.quote !== "USDT" || p.status !== 1) continue;
+      const base = (p.base || "").toUpperCase();
+      if (!base) continue;
+      const maxQuote = parseFloat(p.max_quote_amount || "0");
+      if (!Number.isFinite(maxQuote) || maxQuote <= 0) continue;
+      // If duplicates exist, keep the max cap we see.
+      const prev = maxQuoteUsdtByBase.get(base);
+      if (prev == null || maxQuote > prev) maxQuoteUsdtByBase.set(base, maxQuote);
     }
   }
 
@@ -120,9 +108,9 @@ export async function fetchGateBorrowInfo(
   for (const token of tokens) {
     const upper = token.toUpperCase();
     const spotPrice = spotMap.get(upper) ?? 0;
-    const liquidityToken = availableTokenMap.get(upper);
-    const liquidityUsdt =
-      liquidityToken != null && spotPrice > 0 ? liquidityToken * spotPrice : null;
+    const liquidityUsdt = maxQuoteUsdtByBase.get(upper) ?? null;
+    const liquidityToken =
+      liquidityUsdt != null && spotPrice > 0 ? liquidityUsdt / spotPrice : null;
 
     result.set(upper, {
       currency: upper,
